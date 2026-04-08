@@ -15,7 +15,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import {
   LineChart, Line, BarChart, Bar, AreaChart, Area,
-  XAxis, YAxis, CartesianGrid,
+  XAxis, YAxis, CartesianGrid, ReferenceLine,
   Tooltip as RechartsTooltip, ResponsiveContainer, Legend, Cell, PieChart, Pie,
   ComposedChart,
 } from "recharts";
@@ -244,6 +244,14 @@ interface AnalysisData {
       debtIssuance: number; debtRepayment: number; netChange: number;
     }[];
   };
+  priceHistory: {
+    "1D": { t: string; c: number }[];
+    "YTD": { t: string; c: number }[];
+    "1Y": { t: string; c: number }[];
+    "5Y": { t: string; c: number }[];
+    "10Y": { t: string; c: number }[];
+    "ALL": { t: string; c: number }[];
+  };
   bullCase: string[];
   bearCase: string[];
   risks: string[];
@@ -254,6 +262,52 @@ interface AnalysisData {
     positionGuidance: string;
   };
 }
+
+// ─── Price series generator (deterministic, no Math.random) ─────────────────
+function genSeries(
+  total: number,
+  waypoints: [number, number][],   // [pointIndex, price]
+  labelFn: (i: number) => string,
+  vol: number = 0.015
+): { t: string; c: number }[] {
+  const lerp = (i: number) => {
+    for (let w = 0; w < waypoints.length - 1; w++) {
+      const [ia, pa] = waypoints[w], [ib, pb] = waypoints[w + 1];
+      if (i >= ia && i <= ib) return pa + (pb - pa) * ((i - ia) / (ib - ia));
+    }
+    return waypoints[waypoints.length - 1][1];
+  };
+  return Array.from({ length: total }, (_, i) => {
+    const base = lerp(i);
+    const r = ((i * 9301 + 49297) % 233280) / 233280;
+    return { t: labelFn(i), c: Math.round(Math.max(base + (r - 0.5) * 2 * vol * base, 0.01) * 100) / 100 };
+  });
+}
+
+// Pre-built AAPL price history for demo
+const AAPL_PRICE_HISTORY = {
+  "1D": genSeries(78, [[0,220.5],[20,219.3],[45,222.1],[77,223.45]], i => {
+    const m = 570 + i * 5, h = Math.floor(m/60), min = m%60, ap = h < 12 ? "AM" : "PM", h12 = h > 12 ? h-12 : h;
+    return `${h12}:${min.toString().padStart(2,"0")} ${ap}`;
+  }, 0.003),
+  "YTD": genSeries(68, [[0,243.0],[8,252.0],[22,235.0],[45,228.0],[67,223.45]], i => {
+    const d = new Date(2026, 0, 2 + Math.floor(i * 1.44));
+    return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  }, 0.01),
+  "1Y": genSeries(52, [[0,171.0],[10,196.0],[28,255.0],[40,242.0],[51,223.45]], i => {
+    const d = new Date(new Date(2025,3,8).getTime() + i * 7 * 86400000);
+    return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  }, 0.015),
+  "5Y": genSeries(60, [[0,127.0],[12,179.0],[20,155.0],[32,120.0],[42,185.0],[52,259.0],[59,223.45]], i => {
+    const d = new Date(2021, 3 + i, 1);
+    return d.toLocaleDateString("en-US", { month: "short", year: "2-digit" });
+  }, 0.02),
+  "10Y": genSeries(120, [[0,90.0],[24,80.0],[42,57.0],[54,148.0],[66,179.0],[74,130.0],[90,185.0],[108,259.0],[119,223.45]], i => {
+    const d = new Date(2016, 3 + i, 1);
+    return d.toLocaleDateString("en-US", { month: "short", year: "2-digit" });
+  }, 0.025),
+  "ALL": genSeries(46, [[0,0.10],[5,0.40],[10,1.20],[15,2.50],[20,29.0],[23,6.0],[28,22.0],[30,6.50],[35,53.0],[40,95.0],[43,177.0],[45,223.45]], i => String(1980+i), 0.05),
+} as AnalysisData["priceHistory"];
 
 interface PortfolioItem {
   ticker: string;
@@ -505,7 +559,8 @@ const DEMO_DATA: AnalysisData = {
     rating: "WATCHLIST",
     summary: "Exceptional business with a wide moat and best-in-class capital allocation, but current valuation (34x P/E, -11% DCF upside) offers insufficient margin of safety. Accumulate on a pullback to $195-205 range.",
     positionGuidance: "Wait for 10-15% pullback. Target entry near DCF intrinsic value (~$198). Position size: 3-5% of portfolio given concentration risk."
-  }
+  },
+  priceHistory: AAPL_PRICE_HISTORY,
 };
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -557,6 +612,145 @@ function SectionTitle({ icon: Icon, title, subtitle }: { icon: any; title: strin
         {subtitle && <p className="text-xs text-zinc-500 mt-1">{subtitle}</p>}
       </div>
     </div>
+  );
+}
+
+type PricePeriod = "1D" | "YTD" | "1Y" | "5Y" | "10Y" | "ALL";
+const PERIODS: PricePeriod[] = ["1D", "YTD", "1Y", "5Y", "10Y", "ALL"];
+
+function CustomPriceTooltip({ active, payload, startPrice }: { active?: boolean; payload?: any[]; startPrice: number }) {
+  if (!active || !payload?.length) return null;
+  const price = payload[0].value as number;
+  const chg = price - startPrice;
+  const chgPct = (chg / startPrice) * 100;
+  const pos = chg >= 0;
+  return (
+    <div className="bg-zinc-800 border border-zinc-600 rounded px-3 py-2 text-xs shadow-xl">
+      <div className="text-zinc-300 font-mono font-semibold">${price.toFixed(2)}</div>
+      <div className={pos ? "text-emerald-400" : "text-red-400"}>
+        {pos ? "+" : ""}{chg.toFixed(2)} ({pos ? "+" : ""}{chgPct.toFixed(2)}%)
+      </div>
+      <div className="text-zinc-500 mt-0.5">{payload[0].payload.t}</div>
+    </div>
+  );
+}
+
+function PriceChart({ data }: { data: AnalysisData }) {
+  const [period, setPeriod] = useState<PricePeriod>("1Y");
+  const series = data.priceHistory[period] ?? [];
+  if (!series.length) return null;
+
+  const startPrice = series[0].c;
+  const endPrice = series[series.length - 1].c;
+  const chg = endPrice - startPrice;
+  const chgPct = (chg / startPrice) * 100;
+  const pos = chg >= 0;
+  const color = pos ? "#10b981" : "#ef4444";
+  const gradId = `pcg-${period}`;
+
+  const prices = series.map(p => p.c);
+  const minP = Math.min(...prices);
+  const maxP = Math.max(...prices);
+  const pad = (maxP - minP) * 0.08;
+
+  // Tick labels — show ~6 evenly spaced
+  const tickIndices = [0, Math.floor(series.length*0.2), Math.floor(series.length*0.4), Math.floor(series.length*0.6), Math.floor(series.length*0.8), series.length-1];
+
+  return (
+    <Card className="bg-zinc-900 border-zinc-800">
+      <CardContent className="p-4 pb-3">
+        {/* Top bar: price + change + period buttons */}
+        <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+          <div className="flex items-baseline gap-2">
+            <span className="text-2xl font-bold text-zinc-100">${endPrice.toFixed(2)}</span>
+            <span className={`text-sm font-semibold ${pos ? "text-emerald-400" : "text-red-400"}`}>
+              {pos ? "+" : ""}{chg.toFixed(2)} ({pos ? "+" : ""}{chgPct.toFixed(2)}%)
+            </span>
+            <span className="text-xs text-zinc-500">{period === "1D" ? "Today" : period}</span>
+          </div>
+          <div className="flex items-center gap-0.5 bg-zinc-800 rounded p-0.5">
+            {PERIODS.map(p => (
+              <button
+                key={p}
+                onClick={() => setPeriod(p)}
+                className={`px-2.5 py-1 text-xs font-medium rounded transition-all ${
+                  period === p
+                    ? "bg-zinc-700 text-zinc-100 shadow"
+                    : "text-zinc-500 hover:text-zinc-300"
+                }`}
+              >{p}</button>
+            ))}
+          </div>
+        </div>
+
+        {/* Chart */}
+        <ResponsiveContainer width="100%" height={220}>
+          <AreaChart data={series} margin={{ top: 8, right: 0, bottom: 0, left: 0 }}>
+            <defs>
+              <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={color} stopOpacity={0.25} />
+                <stop offset="100%" stopColor={color} stopOpacity={0.02} />
+              </linearGradient>
+            </defs>
+            <XAxis
+              dataKey="t"
+              ticks={tickIndices.map(i => series[i]?.t).filter(Boolean)}
+              tick={{ fontSize: 10, fill: "#71717a" }}
+              axisLine={false}
+              tickLine={false}
+              interval="preserveStartEnd"
+            />
+            <YAxis
+              domain={[minP - pad, maxP + pad]}
+              tick={{ fontSize: 10, fill: "#71717a" }}
+              axisLine={false}
+              tickLine={false}
+              width={56}
+              tickFormatter={(v: number) => period === "ALL" && v < 10 ? `$${v.toFixed(2)}` : `$${v.toFixed(0)}`}
+              orientation="right"
+            />
+            <RechartsTooltip
+              content={<CustomPriceTooltip startPrice={startPrice} />}
+              cursor={{ stroke: "#71717a", strokeWidth: 1, strokeDasharray: "3 3" }}
+            />
+            {/* Baseline reference */}
+            <ReferenceLine y={startPrice} stroke="#52525b" strokeDasharray="4 4" strokeWidth={1} />
+            <Area
+              type="monotone"
+              dataKey="c"
+              stroke={color}
+              strokeWidth={1.5}
+              fill={`url(#${gradId})`}
+              dot={false}
+              activeDot={{ r: 3, fill: color, stroke: "#18181b", strokeWidth: 2 }}
+              isAnimationActive={false}
+            />
+          </AreaChart>
+        </ResponsiveContainer>
+
+        {/* Bottom stats row */}
+        <div className="flex items-center gap-6 mt-1 pt-2 border-t border-zinc-800">
+          <div className="text-[10px] text-zinc-500">
+            <span className="text-zinc-400">Low </span>
+            <span className="font-mono">${minP.toFixed(2)}</span>
+          </div>
+          <div className="h-0.5 flex-1 rounded-full overflow-hidden bg-zinc-800">
+            <div
+              className="h-full rounded-full"
+              style={{
+                marginLeft: `${((endPrice - minP) / (maxP - minP)) * 100}%`,
+                width: "2px",
+                background: color,
+              }}
+            />
+          </div>
+          <div className="text-[10px] text-zinc-500">
+            <span className="text-zinc-400">High </span>
+            <span className="font-mono">${maxP.toFixed(2)}</span>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -985,6 +1179,9 @@ export default function App() {
           <MetricCard label="DCF Upside" value={fmt.pct(d.dcf.upside)} trend={d.dcf.upside > 0 ? "up" : "down"} icon={Target} tooltip="Upside to intrinsic value." />
           <MetricCard label="Analyst Target" value={`$${d.analyst.priceTarget}`} subValue={fmt.pct(d.analyst.targetUpside)} trend={d.analyst.targetUpside > 0 ? "up" : "down"} icon={BookOpen} tooltip="Consensus analyst price target." />
         </div>
+
+        {/* Price Chart */}
+        {data.priceHistory && <PriceChart data={data} />}
 
         {/* Tabs */}
         <Tabs defaultValue="fundamentals" className="space-y-4">
